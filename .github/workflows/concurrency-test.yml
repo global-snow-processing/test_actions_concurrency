@@ -294,7 +294,7 @@ jobs:
                   print(f"warning: could not read jobs for run {run['id']}: {exc}", file=sys.stderr)
                   skipped.append(run["id"])
                   continue
-              for job in jobs(f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs"):
+              for job in jobs:
                   # A job cancelled or skipped while still queued is reported with
                   # started_at and completed_at set even though it never occupied a
                   # runner. Counting those would inflate the peak by the size of the
