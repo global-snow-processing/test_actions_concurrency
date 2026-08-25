@@ -280,6 +280,15 @@ jobs:
               if parse(run["run_started_at"]) < start_of_interest:
                   continue
               for job in api_pages(f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs"):
+                  # A job cancelled or skipped while still queued is reported with
+                  # started_at and completed_at set even though it never occupied a
+                  # runner. Counting those would inflate the peak by the size of the
+                  # queue. Only a job that was actually assigned a runner has a
+                  # runner_id, so that is the real signal.
+                  if job.get("conclusion") == "skipped":
+                      continue
+                  if job.get("runner_id") is None and not job.get("runner_name"):
+                      continue
                   if not job.get("started_at") or not job.get("completed_at"):
                       continue
                   s, e = parse(job["started_at"]), parse(job["completed_at"])
