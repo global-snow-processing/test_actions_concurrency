@@ -285,6 +285,7 @@ jobs:
           intervals = []
           per_run = {}
           skipped = []
+          never_started = 0
           for run in runs:
               if parse(run["run_started_at"]) < start_of_interest:
                   continue
@@ -295,18 +296,24 @@ jobs:
                   skipped.append(run["id"])
                   continue
               for job in jobs:
-                  # A job cancelled or skipped while still queued is reported with
-                  # started_at and completed_at set even though it never occupied a
-                  # runner. Counting those would inflate the peak by the size of the
-                  # queue. Only a job that was actually assigned a runner has a
-                  # runner_id, so that is the real signal.
+                  # A queued job is reported with started_at already set, equal to
+                  # created_at, and that value is left behind if the job is then
+                  # cancelled without ever running. Such a job never occupied a
+                  # runner, and counting it would inflate the peak by the size of
+                  # the queue. A job that really started always has steps, so use
+                  # the steps themselves as the occupancy window: the first step's
+                  # start to the last step's end.
                   if job.get("conclusion") == "skipped":
                       continue
-                  if job.get("runner_id") is None and not job.get("runner_name"):
+                  steps = [
+                      st for st in (job.get("steps") or [])
+                      if st.get("started_at") and st.get("completed_at")
+                  ]
+                  if not steps:
+                      never_started += 1
                       continue
-                  if not job.get("started_at") or not job.get("completed_at"):
-                      continue
-                  s, e = parse(job["started_at"]), parse(job["completed_at"])
+                  s = min(parse(st["started_at"]) for st in steps)
+                  e = max(parse(st["completed_at"]) for st in steps)
                   if e <= s:
                       continue
                   intervals.append((s, e))
@@ -333,13 +340,14 @@ jobs:
 
           overall, at = peak_of(intervals)
           print("Occupied runners over time, counting every job in every run in this repository")
-          print("(`started_at` to `completed_at`, so runner setup is included).\n")
+          print("(first step start to last step end, so runner setup is included).\n")
           print("| Metric | Value |")
           print("| --- | --- |")
           print(f"| Runs considered | {len(per_run)} |")
           print(f"| Jobs considered | {len(intervals)} |")
           print(f"| **Peak occupied runners** | **{overall}** |")
           print(f"| Peak reached at | {at.strftime('%H:%M:%SZ')} |")
+          print(f"| Jobs that never started (excluded) | {never_started} |")
           if skipped:
               print(f"| Runs skipped (unreadable) | {len(skipped)} |")
           print()
