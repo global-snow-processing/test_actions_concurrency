@@ -1,26 +1,39 @@
 name: Concurrency test
 
-# Fans out N identical no-op matrix jobs on standard ubuntu-latest runners so we
-# can observe how many actually execute at the same time. Each job records the
-# wall-clock window it occupied a runner; a final job stitches those windows
-# together and reports the peak observed concurrency.
+# Fans out N identical no-op matrix jobs on standard ubuntu-latest runners to
+# measure how many actually execute at the same time.
+#
+# Two numbers come out of a run:
+#   * in-job peak      - from timestamps recorded inside each job, this run only
+#   * runner-level peak - from the Actions API, across every overlapping run in
+#                         this repo, so several simultaneous runs can be used to
+#                         probe past the 256-job-per-run matrix cap
+#
+# The census window bounds the experiment: jobs that finally get a runner after
+# the window has closed exit immediately instead of holding one, so a low
+# concurrency limit produces a fast answer instead of an hours-long run.
 
 on:
   workflow_dispatch:
     inputs:
       job_count:
-        description: "Number of matrix jobs to fan out (1-256)"
+        description: "Matrix jobs to fan out (1-256, GitHub's per-run matrix cap)"
         required: false
-        default: "60"
-      sleep_seconds:
-        description: "Seconds each job holds its runner"
+        default: "256"
+      hold_seconds:
+        description: "Seconds each job holds its runner (90+ recommended)"
         required: false
-        default: "60"
+        default: "90"
+      census_minutes:
+        description: "Minutes to keep holding runners before draining the queue"
+        required: false
+        default: "10"
   push:
     branches: ["**"]
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   prepare:
@@ -29,41 +42,56 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       job_count: ${{ steps.gen.outputs.job_count }}
-      sleep_seconds: ${{ steps.gen.outputs.sleep_seconds }}
+      hold_seconds: ${{ steps.gen.outputs.hold_seconds }}
+      deadline: ${{ steps.gen.outputs.deadline }}
     steps:
       - name: Generate matrix
         id: gen
         env:
-          # `inputs` is empty for push events, so fall back to a small run.
+          # `inputs` is empty for push events, so fall back to a small smoke run.
           JOB_COUNT: ${{ inputs.job_count || '4' }}
-          SLEEP_SECONDS: ${{ inputs.sleep_seconds || '30' }}
+          HOLD_SECONDS: ${{ inputs.hold_seconds || '30' }}
+          CENSUS_MINUTES: ${{ inputs.census_minutes || '5' }}
         run: |
           set -euo pipefail
 
-          case "$JOB_COUNT" in
-            ''|*[!0-9]*) echo "job_count must be a positive integer, got '$JOB_COUNT'" >&2; exit 1 ;;
-          esac
-          case "$SLEEP_SECONDS" in
-            ''|*[!0-9]*) echo "sleep_seconds must be a non-negative integer, got '$SLEEP_SECONDS'" >&2; exit 1 ;;
-          esac
+          for pair in "JOB_COUNT:$JOB_COUNT" "HOLD_SECONDS:$HOLD_SECONDS" "CENSUS_MINUTES:$CENSUS_MINUTES"; do
+            name="${pair%%:*}"; value="${pair#*:}"
+            case "$value" in
+              ''|*[!0-9]*) echo "$name must be a non-negative integer, got '$value'" >&2; exit 1 ;;
+            esac
+          done
+
+          # 256 is GitHub's hard cap on matrix jobs generated per workflow run.
+          # To probe higher, dispatch several runs at once — the report job
+          # aggregates across every overlapping run in this repository.
           if [ "$JOB_COUNT" -lt 1 ] || [ "$JOB_COUNT" -gt 256 ]; then
-            echo "job_count must be between 1 and 256 (GitHub's per-workflow-run matrix cap), got $JOB_COUNT" >&2
+            echo "job_count must be between 1 and 256, got $JOB_COUNT" >&2
+            exit 1
+          fi
+          if [ "$CENSUS_MINUTES" -lt 1 ]; then
+            echo "census_minutes must be at least 1, got $CENSUS_MINUTES" >&2
             exit 1
           fi
 
+          deadline=$(( $(date -u +%s) + CENSUS_MINUTES * 60 ))
           matrix="$(seq 1 "$JOB_COUNT" | jq -cs .)"
+
           {
             echo "matrix=$matrix"
             echo "job_count=$JOB_COUNT"
-            echo "sleep_seconds=$SLEEP_SECONDS"
+            echo "hold_seconds=$HOLD_SECONDS"
+            echo "deadline=$deadline"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Fanning out $JOB_COUNT jobs, each holding a runner for ${SLEEP_SECONDS}s."
+          echo "Fanning out $JOB_COUNT jobs; each holds a runner for ${HOLD_SECONDS}s."
+          echo "Census window closes at $(date -u -d "@$deadline" +%Y-%m-%dT%H:%M:%SZ); jobs starting after that drain immediately."
 
   spin:
     name: "spin ${{ matrix.id }}"
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -71,17 +99,31 @@ jobs:
     steps:
       - name: Hold a runner and record the window
         env:
-          SLEEP_SECONDS: ${{ needs.prepare.outputs.sleep_seconds }}
+          HOLD_SECONDS: ${{ needs.prepare.outputs.hold_seconds }}
+          DEADLINE: ${{ needs.prepare.outputs.deadline }}
           JOB_ID: ${{ matrix.id }}
         run: |
           set -euo pipefail
-          start="$(date -u +%s)"
-          echo "job $JOB_ID started at $(date -u -d "@$start" +%Y-%m-%dT%H:%M:%SZ) on $(hostname)"
-          sleep "$SLEEP_SECONDS"
-          end="$(date -u +%s)"
-          echo "job $JOB_ID finished at $(date -u -d "@$end" +%Y-%m-%dT%H:%M:%SZ)"
           mkdir -p windows
-          printf '%s %s %s\n' "$JOB_ID" "$start" "$end" > "windows/job-${JOB_ID}.txt"
+          now="$(date -u +%s)"
+
+          if [ "$now" -ge "$DEADLINE" ]; then
+            echo "job $JOB_ID got a runner at $(date -u -d "@$now" +%H:%M:%SZ), after the census window closed — draining without holding."
+            printf '%s %s %s 0\n' "$JOB_ID" "$now" "$now" > "windows/job-${JOB_ID}.txt"
+            exit 0
+          fi
+
+          hold="$HOLD_SECONDS"
+          remaining=$(( DEADLINE - now ))
+          if [ "$hold" -gt "$remaining" ]; then
+            hold="$remaining"
+          fi
+
+          echo "job $JOB_ID started at $(date -u -d "@$now" +%H:%M:%SZ), holding ${hold}s"
+          sleep "$hold"
+          end="$(date -u +%s)"
+          echo "job $JOB_ID finished at $(date -u -d "@$end" +%H:%M:%SZ)"
+          printf '%s %s %s 1\n' "$JOB_ID" "$now" "$end" > "windows/job-${JOB_ID}.txt"
 
       - name: Upload window
         uses: actions/upload-artifact@v4
@@ -103,39 +145,42 @@ jobs:
           path: windows
           merge-multiple: true
 
-      - name: Compute peak observed concurrency
+      - name: In-job concurrency (this run)
         env:
           REQUESTED: ${{ needs.prepare.outputs.job_count }}
-          SLEEP_SECONDS: ${{ needs.prepare.outputs.sleep_seconds }}
+          HOLD_SECONDS: ${{ needs.prepare.outputs.hold_seconds }}
         run: |
           set -euo pipefail
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import glob, os, datetime
 
           requested = os.environ.get("REQUESTED", "?")
-          hold = os.environ.get("SLEEP_SECONDS", "?")
+          hold = os.environ.get("HOLD_SECONDS", "?")
 
-          windows = []
+          held, drained = [], 0
           for path in sorted(glob.glob("windows/**/job-*.txt", recursive=True)):
               with open(path) as fh:
                   for line in fh:
                       parts = line.split()
-                      if len(parts) == 3:
-                          jid, start, end = parts
-                          windows.append((int(start), int(end), jid))
+                      if len(parts) != 4:
+                          continue
+                      jid, start, end, was_held = parts
+                      if was_held == "1":
+                          held.append((int(start), int(end), jid))
+                      else:
+                          drained += 1
 
-          print("## Concurrency test results\n")
-          if not windows:
-              print("No job windows were reported — every matrix job failed or was cancelled.")
+          print("## In-job concurrency (this run)\n")
+          if not held:
+              print("No job held a runner inside the census window.\n")
               raise SystemExit(0)
 
-          # Sweep line over start/end events to find the peak overlap.
+          # Sweep line over start/end events. Ends sort before starts at the same
+          # second, so a runner freed and immediately reused is not double counted.
           events = []
-          for start, end, _ in windows:
+          for start, end, _ in held:
               events.append((start, 1))
               events.append((end, -1))
-          # Ends are processed before starts at the same second, so a runner that
-          # frees up and is immediately reused is not double counted.
           events.sort(key=lambda e: (e[0], e[1]))
 
           current = peak = 0
@@ -145,44 +190,132 @@ jobs:
               if current > peak:
                   peak, peak_at = current, ts
 
-          t0 = min(w[0] for w in windows)
-          t1 = max(w[1] for w in windows)
+          t0 = min(w[0] for w in held)
+          t1 = max(w[1] for w in held)
 
           def iso(ts):
               return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%H:%M:%SZ")
 
-          print(f"| Metric | Value |")
-          print(f"| --- | --- |")
+          print("| Metric | Value |")
+          print("| --- | --- |")
           print(f"| Jobs requested | {requested} |")
-          print(f"| Jobs that reported a window | {len(windows)} |")
-          print(f"| Runner hold time per job | {hold}s |")
-          print(f"| **Peak observed concurrency** | **{peak}** |")
+          print(f"| Jobs that held a runner | {len(held)} |")
+          print(f"| Jobs drained after the census window | {drained} |")
+          print(f"| Hold time per job | {hold}s |")
+          print(f"| **Peak in-job concurrency** | **{peak}** |")
           print(f"| Peak reached at | {iso(peak_at)} |")
-          print(f"| First job start | {iso(t0)} |")
-          print(f"| Last job end | {iso(t1)} |")
-          print(f"| Total wall clock | {t1 - t0}s |")
+          print(f"| First hold start | {iso(t0)} |")
+          print(f"| Last hold end | {iso(t1)} |")
           print()
 
-          if peak < len(windows):
-              print(
-                  f"Peak concurrency ({peak}) is below the number of jobs ({len(windows)}), "
-                  "so jobs were queued waiting for a free concurrency slot.\n"
-              )
+          if peak < len(held):
+              print(f"Peak ({peak}) is below the number of holding jobs ({len(held)}) — jobs queued waiting for a slot.\n")
           else:
-              print(
-                  f"All {len(windows)} jobs ran at the same time — the account limit was not "
-                  "the binding constraint at this fan-out.\n"
-              )
+              print(f"All {len(held)} holding jobs overlapped; the limit was not the binding constraint at this fan-out.\n")
 
-          print("### Timeline\n")
-          print("Each row is one job; `#` marks the seconds it held a runner.\n")
+          print("<details><summary>Timeline</summary>\n")
           print("```")
           span = max(t1 - t0, 1)
-          width = 80
-          for start, end, jid in sorted(windows, key=lambda w: (w[0], w[2])):
+          width = 76
+          for start, end, jid in sorted(held, key=lambda w: (w[0], int(w[2]))):
               lo = int((start - t0) / span * width)
               hi = max(int((end - t0) / span * width), lo + 1)
-              bar = " " * lo + "#" * (hi - lo)
-              print(f"{jid:>4} |{bar:<{width}}| {end - start:>4}s")
+              print(f"{jid:>4} |{' ' * lo + '#' * (hi - lo):<{width}}| {end - start:>4}s")
           print("```")
+          print("\n</details>")
+          PY
+
+      - name: Runner-level concurrency (all overlapping runs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          THIS_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import datetime, json, os, subprocess
+
+          repo = os.environ["REPO"]
+          this_run = int(os.environ["THIS_RUN"])
+
+          def api(path):
+              out = subprocess.run(
+                  ["gh", "api", "--paginate", "--slurp", path],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+              return json.loads(out)
+
+          def parse(ts):
+              return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                  tzinfo=datetime.timezone.utc
+              )
+
+          runs = []
+          for page in api(f"/repos/{repo}/actions/runs?per_page=100"):
+              runs.extend(page.get("workflow_runs", []))
+
+          this = next((r for r in runs if r["id"] == this_run), None)
+          if this is None:
+              print("## Runner-level concurrency\n\nCould not locate this run via the API.")
+              raise SystemExit(0)
+
+          # Anything that started within an hour of this run is a candidate for
+          # overlapping with it; exact overlap is decided per job below.
+          start_of_interest = parse(this["run_started_at"]) - datetime.timedelta(hours=1)
+
+          intervals = []
+          per_run = {}
+          for run in runs:
+              if parse(run["run_started_at"]) < start_of_interest:
+                  continue
+              for page in api(f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=latest"):
+                  for job in page.get("jobs", []):
+                      if not job.get("started_at") or not job.get("completed_at"):
+                          continue
+                      s, e = parse(job["started_at"]), parse(job["completed_at"])
+                      if e <= s:
+                          continue
+                      intervals.append((s, e))
+                      per_run.setdefault(run["id"], []).append((s, e))
+
+          print("## Runner-level concurrency (all overlapping runs)\n")
+          if not intervals:
+              print("No completed jobs found in the window.")
+              raise SystemExit(0)
+
+          def peak_of(items):
+              events = []
+              for s, e in items:
+                  events.append((s, 1))
+                  events.append((e, -1))
+              events.sort(key=lambda x: (x[0], x[1]))
+              cur = top = 0
+              at = events[0][0]
+              for ts, d in events:
+                  cur += d
+                  if cur > top:
+                      top, at = cur, ts
+              return top, at
+
+          overall, at = peak_of(intervals)
+          print("Occupied runners over time, counting every job in every run in this repository")
+          print("(`started_at` to `completed_at`, so runner setup is included).\n")
+          print("| Metric | Value |")
+          print("| --- | --- |")
+          print(f"| Runs considered | {len(per_run)} |")
+          print(f"| Jobs considered | {len(intervals)} |")
+          print(f"| **Peak occupied runners** | **{overall}** |")
+          print(f"| Peak reached at | {at.strftime('%H:%M:%SZ')} |")
+          print()
+
+          if len(per_run) > 1:
+              print("| Run | Jobs | Peak within that run |")
+              print("| --- | --- | --- |")
+              for rid, items in sorted(per_run.items()):
+                  top, _ = peak_of(items)
+                  marker = " (this run)" if rid == this_run else ""
+                  print(f"| [{rid}](https://github.com/{repo}/actions/runs/{rid}){marker} | {len(items)} | {top} |")
+              print()
+              print("A peak that matches the sum of the per-run peaks means the runs were not competing;")
+              print("a peak well below that sum is the account-wide concurrency limit showing itself.\n")
           PY

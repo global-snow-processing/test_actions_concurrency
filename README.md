@@ -24,38 +24,60 @@ Nothing is built, nothing is published, and no secrets are used.
 Automatic: any push runs a small 4-job / 30-second version, just enough to
 prove Actions works in the org.
 
-Manual: **Actions → Concurrency test → Run workflow**, with two inputs:
+Manual: **Actions → Concurrency test → Run workflow**, with three inputs:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `job_count` | `60` | Matrix jobs to fan out (1–256, GitHub's per-run matrix cap) |
-| `sleep_seconds` | `60` | How long each job holds its runner |
+| `job_count` | `256` | Matrix jobs to fan out (1–256, GitHub's per-run matrix cap) |
+| `hold_seconds` | `90` | How long each job holds its runner |
+| `census_minutes` | `10` | How long to keep holding before draining the queue |
 
-Pick `sleep_seconds` comfortably longer than runner startup (~15–30s), or jobs
-finish before their neighbours have booted and the overlap looks artificially
-low.
+Keep `hold_seconds` comfortably longer than runner startup, which is ~15–30s and
+is staggered across a large fan-out. At 30s holds the early jobs finish before
+the later ones have booted, and the measured overlap comes out lower than the
+real limit. 90s is a good floor; 120s is safer for fan-outs above 200.
+
+`census_minutes` bounds the experiment. Once the window closes, jobs still
+waiting for a runner exit immediately instead of holding one, so a low limit
+gives a fast answer rather than an hours-long run.
+
+### Going past 256 jobs
+
+256 matrix jobs per workflow run is a hard GitHub limit, so a single run cannot
+prove a limit above 256. To probe higher, dispatch several runs at the same time
+(`Run workflow` a few times in a row, or the same via the API). Each run's
+report aggregates **runner-level concurrency across every overlapping run in the
+repository**, so four simultaneous 256-job runs measure the account-wide ceiling
+up to 1024.
 
 ## Reading the results
 
-The `report` job writes a summary to the run page:
+The `report` job writes two sections to the run page.
 
-- **Peak observed concurrency** — the headline number. If it plateaus at 60
-  while 120 jobs were requested, the org is still on the default standard-runner
-  limit.
-- **Total wall clock** — with a hard cap of C and a hold time of T seconds,
-  N jobs take roughly `ceil(N / C) * T` plus startup overhead.
-- **Timeline** — an ASCII chart of every job's window, which makes queueing
-  visible as a staircase instead of one solid block.
+**In-job concurrency (this run)** — measured from timestamps taken inside each
+job, so runner setup is excluded. This is the count of jobs actually executing
+at once. It also prints a timeline, where queueing shows up as a staircase
+rather than one solid block.
+
+**Runner-level concurrency (all overlapping runs)** — measured from the Actions
+API using each job's `started_at`/`completed_at`, across every run in the repo
+that overlaps this one. This is the number of runners the account had allocated,
+and it is the number to compare against the concurrency limit. When several runs
+are in flight it also breaks the peak down per run: if the overall peak is well
+below the sum of the per-run peaks, the runs were competing for the same pool —
+that is the account limit showing itself.
 
 ### Suggested check for the limit increase
 
-Run with `job_count: 120`, `sleep_seconds: 90`.
+Dispatch two runs back to back with `job_count: 256`, `hold_seconds: 120`.
 
-- Peak ≈ 120, one wave, wall clock ≈ 2 min → the 120-job limit is live.
-- Peak ≈ 60, two staircase waves, wall clock ≈ 4 min → still capped at 60.
+- Peak occupied runners ≈ 60 → still on the Team default.
+- Peak ≈ 120 → the requested increase is live.
+- Peak plateauing well below 60 → something else is capping the org, worth
+  raising with Support on its own.
 
-Repeat the same run before and after the change and the two summaries are a
-clean before/after for the support ticket.
+Run the same thing before and after the change; the two summaries are a clean
+before/after for the ticket.
 
 ## Notes on what this does and does not measure
 
