@@ -3,11 +3,18 @@ name: Concurrency test
 # Fans out N identical no-op matrix jobs on standard ubuntu-latest runners to
 # measure how many actually execute at the same time.
 #
-# Two numbers come out of a run:
-#   * in-job peak      - from timestamps recorded inside each job, this run only
-#   * runner-level peak - from the Actions API, across every overlapping run in
-#                         this repo, so several simultaneous runs can be used to
-#                         probe past the 256-job-per-run matrix cap
+# The question is "how many runners does the account hand out at once", and
+# occupancy alone cannot answer it: 11 runners busy with nothing waiting means
+# the fan-out never asked for more, while 11 busy with 245 jobs queued is a
+# hard ceiling. The report therefore pairs occupancy with queue depth over
+# time, and says which of the two situations it observed.
+#
+# Three numbers come out of a run:
+#   * in-job peak       - from timestamps recorded inside each job, this run
+#                         only, so runner setup is excluded
+#   * runner-level peak - from the Actions API, across every run whose jobs
+#                         actually overlap this run's probe window
+#   * peak queue depth  - jobs created but not yet on a runner, same window
 #
 # The census window bounds the experiment: jobs that finally get a runner after
 # the window has closed exit immediately instead of holding one, so a low
@@ -21,15 +28,20 @@ on:
         required: false
         default: "256"
       hold_seconds:
-        description: "Seconds each job holds its runner (90+ recommended)"
+        description: "Seconds each job holds its runner"
         required: false
-        default: "90"
+        default: "180"
       census_minutes:
         description: "Minutes to keep holding runners before draining the queue"
         required: false
-        default: "10"
+        default: "20"
+      expected_limit:
+        description: "Concurrency you expect, used only for the feasibility note"
+        required: false
+        default: "120"
   push:
     branches: ["**"]
+    paths-ignore: ["README.md"]
 
 permissions:
   contents: read
@@ -52,10 +64,12 @@ jobs:
           JOB_COUNT: ${{ inputs.job_count || '4' }}
           HOLD_SECONDS: ${{ inputs.hold_seconds || '30' }}
           CENSUS_MINUTES: ${{ inputs.census_minutes || '5' }}
+          EXPECTED_LIMIT: ${{ inputs.expected_limit || '120' }}
         run: |
           set -euo pipefail
 
-          for pair in "JOB_COUNT:$JOB_COUNT" "HOLD_SECONDS:$HOLD_SECONDS" "CENSUS_MINUTES:$CENSUS_MINUTES"; do
+          for pair in "JOB_COUNT:$JOB_COUNT" "HOLD_SECONDS:$HOLD_SECONDS" \
+                      "CENSUS_MINUTES:$CENSUS_MINUTES" "EXPECTED_LIMIT:$EXPECTED_LIMIT"; do
             name="${pair%%:*}"; value="${pair#*:}"
             case "$value" in
               ''|*[!0-9]*) echo "$name must be a non-negative integer, got '$value'" >&2; exit 1 ;;
@@ -64,13 +78,17 @@ jobs:
 
           # 256 is GitHub's hard cap on matrix jobs generated per workflow run.
           # To probe higher, dispatch several runs at once — the report job
-          # aggregates across every overlapping run in this repository.
+          # aggregates across every run that overlaps this one's probe window.
           if [ "$JOB_COUNT" -lt 1 ] || [ "$JOB_COUNT" -gt 256 ]; then
             echo "job_count must be between 1 and 256, got $JOB_COUNT" >&2
             exit 1
           fi
           if [ "$CENSUS_MINUTES" -lt 1 ]; then
             echo "census_minutes must be at least 1, got $CENSUS_MINUTES" >&2
+            exit 1
+          fi
+          if [ "$EXPECTED_LIMIT" -lt 1 ]; then
+            echo "expected_limit must be at least 1, got $EXPECTED_LIMIT" >&2
             exit 1
           fi
 
@@ -87,11 +105,23 @@ jobs:
           echo "Fanning out $JOB_COUNT jobs; each holds a runner for ${HOLD_SECONDS}s."
           echo "Census window closes at $(date -u -d "@$deadline" +%Y-%m-%dT%H:%M:%SZ); jobs starting after that drain immediately."
 
+          # Feasibility: how the three knobs interact, printed rather than
+          # left for the reader to work out from a disappointing peak.
+          window=$(( CENSUS_MINUTES * 60 ))
+          clear=$(( JOB_COUNT * HOLD_SECONDS / EXPECTED_LIMIT ))
+          echo "At $EXPECTED_LIMIT concurrent runners, ${JOB_COUNT}x${HOLD_SECONDS}s clears in ~${clear}s against a ${window}s window."
+          if [ "$clear" -gt "$window" ]; then
+            echo "::notice::The fan-out cannot clear inside the census window, so trailing jobs will drain without holding a runner. That is expected and is what bounds the run; the peak is still measured inside the window."
+          fi
+          if [ "$HOLD_SECONDS" -lt 60 ] && [ "$JOB_COUNT" -gt 8 ]; then
+            echo "::warning::hold_seconds=$HOLD_SECONDS is short relative to runner startup (~15-30s, staggered across a large fan-out). The in-job peak will understate concurrency; prefer 120s or more."
+          fi
+
   spin:
     name: "spin ${{ matrix.id }}"
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -154,8 +184,8 @@ jobs:
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import glob, os, datetime
 
-          requested = os.environ.get("REQUESTED", "?")
-          hold = os.environ.get("HOLD_SECONDS", "?")
+          requested = os.environ.get("REQUESTED") or "?"
+          hold = os.environ.get("HOLD_SECONDS") or "?"
 
           held, drained = [], 0
           for path in sorted(glob.glob("windows/**/job-*.txt", recursive=True)):
@@ -207,6 +237,9 @@ jobs:
           print(f"| First hold start | {iso(t0)} |")
           print(f"| Last hold end | {iso(t1)} |")
           print()
+          print("Runner setup is excluded here, so this number runs a little below the")
+          print("runner-level peak. Compare against the concurrency limit using the")
+          print("runner-level section, which counts occupancy the way the limit does.\n")
 
           if peak < len(held):
               print(f"Peak ({peak}) is below the number of holding jobs ({len(held)}) — jobs queued waiting for a slot.\n")
@@ -225,7 +258,7 @@ jobs:
           print("\n</details>")
           PY
 
-      - name: Runner-level concurrency (all overlapping runs)
+      - name: Runner-level concurrency and queue depth
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -237,13 +270,19 @@ jobs:
 
           repo = os.environ["REPO"]
           this_run = int(os.environ["THIS_RUN"])
+          NOW = datetime.datetime.now(datetime.timezone.utc)
+          # Only bounds how far back to page the runs list; whether a run counts
+          # is decided per job by actual overlap with the probe window.
+          LOOKBACK = datetime.timedelta(hours=6)
 
-          def api_pages(path, key):
+          def api_pages(path, key, stop_when=None):
               """Page through a list endpoint by hand.
 
               `gh api --paginate` concatenates JSON objects, which json.loads
               cannot read, and --slurp is too new to rely on across runner
               images. Walking pages explicitly avoids depending on either.
+              `stop_when` ends paging early on a list the API returns
+              newest-first, so a long repository history is not walked in full.
               """
               items, page = [], 1
               while True:
@@ -264,65 +303,51 @@ jobs:
                   items.extend(batch)
                   if len(batch) < 100:
                       return items
+                  if stop_when and stop_when(batch[-1]):
+                      return items
                   page += 1
 
           def parse(ts):
+              if not ts:
+                  return None
               return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
                   tzinfo=datetime.timezone.utc
               )
 
-          runs = api_pages(f"/repos/{repo}/actions/runs", "workflow_runs")
+          def occupancy(job):
+              """(start, end) while the job held a runner, or None if it never did.
 
-          this = next((r for r in runs if r["id"] == this_run), None)
-          if this is None:
-              print("## Runner-level concurrency\n\nCould not locate this run via the API.")
-              raise SystemExit(0)
+              A queued job is reported with started_at already set and equal to
+              created_at, and that stale value survives if the job is later
+              cancelled without ever running, so started_at cannot be trusted on
+              its own. Steps are the honest signal: a job that never started has
+              none, and for one that did, the first step's start to the last
+              step's end is its occupancy. A job still *running* has steps with
+              no completed_at, so its end is now rather than the end of whichever
+              step happens to have finished — taking the latter would truncate
+              every run still in flight alongside this one, which is exactly the
+              case multi-run probing depends on.
+              """
+              if job.get("conclusion") == "skipped":
+                  return None
+              if job.get("status") not in ("in_progress", "completed"):
+                  return None
+              steps = job.get("steps") or []
+              starts = [s for s in (parse(st.get("started_at")) for st in steps) if s]
+              if not starts:
+                  return None
+              start = min(starts)
+              if job.get("status") == "completed":
+                  ends = [e for e in (parse(st.get("completed_at")) for st in steps) if e]
+                  end = max(ends) if ends else parse(job.get("completed_at"))
+              else:
+                  end = NOW
+              end = min(end or NOW, NOW)
+              return (start, end) if end > start else None
 
-          # Anything that started within an hour of this run is a candidate for
-          # overlapping with it; exact overlap is decided per job below.
-          start_of_interest = parse(this["run_started_at"]) - datetime.timedelta(hours=1)
-
-          intervals = []
-          per_run = {}
-          skipped = []
-          never_started = 0
-          for run in runs:
-              if parse(run["run_started_at"]) < start_of_interest:
-                  continue
-              try:
-                  jobs = api_pages(f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
-              except RuntimeError as exc:
-                  print(f"warning: could not read jobs for run {run['id']}: {exc}", file=sys.stderr)
-                  skipped.append(run["id"])
-                  continue
-              for job in jobs:
-                  # A queued job is reported with started_at already set, equal to
-                  # created_at, and that value is left behind if the job is then
-                  # cancelled without ever running. Such a job never occupied a
-                  # runner, and counting it would inflate the peak by the size of
-                  # the queue. A job that really started always has steps, so use
-                  # the steps themselves as the occupancy window: the first step's
-                  # start to the last step's end.
-                  if job.get("conclusion") == "skipped":
-                      continue
-                  steps = [
-                      st for st in (job.get("steps") or [])
-                      if st.get("started_at") and st.get("completed_at")
-                  ]
-                  if not steps:
-                      never_started += 1
-                      continue
-                  s = min(parse(st["started_at"]) for st in steps)
-                  e = max(parse(st["completed_at"]) for st in steps)
-                  if e <= s:
-                      continue
-                  intervals.append((s, e))
-                  per_run.setdefault(run["id"], []).append((s, e))
-
-          print("## Runner-level concurrency (all overlapping runs)\n")
-          if not intervals:
-              print("No completed jobs found in the window.")
-              raise SystemExit(0)
+          def clip(start, end, lo, hi):
+              s, e = max(start, lo), min(end, hi)
+              return (s, e) if e > s else None
 
           def peak_of(items):
               events = []
@@ -331,26 +356,201 @@ jobs:
                   events.append((e, -1))
               events.sort(key=lambda x: (x[0], x[1]))
               cur = top = 0
-              at = events[0][0]
+              at = events[0][0] if events else None
               for ts, d in events:
                   cur += d
                   if cur > top:
                       top, at = cur, ts
               return top, at
 
-          overall, at = peak_of(intervals)
-          print("Occupied runners over time, counting every job in every run in this repository")
-          print("(first step start to last step end, so runner setup is included).\n")
+          def count_at(items, t):
+              return sum(1 for s, e in items if s <= t < e)
+
+          def paired_sweep(occ, q):
+              """Peak occupancy, peak queue depth, and peak occupancy observed
+              while at least one job was queued.
+
+              That last number is the one that decides whether a peak is a
+              ceiling. Keying the verdict on queue depth at the single instant
+              occupancy peaked is fragile: the peak usually lands on the first
+              rise, before anything has had a chance to queue behind it.
+              """
+              events = []
+              for s, e in occ:
+                  events.append((s, 0, 1))
+                  events.append((e, 0, -1))
+              for s, e in q:
+                  events.append((s, 1, 1))
+                  events.append((e, 1, -1))
+              # Ends before starts at equal timestamps, so a runner freed and
+              # immediately reused is not double counted.
+              events.sort(key=lambda x: (x[0], x[2]))
+              busy = waiting = 0
+              peak_o = peak_w = saturated = 0
+              peak_o_at = peak_w_at = saturated_at = None
+              for ts, kind, delta in events:
+                  if kind == 0:
+                      busy += delta
+                  else:
+                      waiting += delta
+                  if busy > peak_o:
+                      peak_o, peak_o_at = busy, ts
+                  if waiting > peak_w:
+                      peak_w, peak_w_at = waiting, ts
+                  if waiting > 0 and busy > saturated:
+                      saturated, saturated_at = busy, ts
+              return (peak_o, peak_o_at), (peak_w, peak_w_at), (saturated, saturated_at)
+
+          # This run's own probe jobs define the window everything else is
+          # measured against, so a peak that happened before this run started
+          # cannot leak into the result.
+          my_jobs = api_pages(
+              f"/repos/{repo}/actions/runs/{this_run}/jobs?filter=latest", "jobs"
+          )
+          probe_windows = [
+              w for w in (occupancy(j) for j in my_jobs if j["name"].startswith("spin")) if w
+          ]
+
+          runs = api_pages(
+              f"/repos/{repo}/actions/runs",
+              "workflow_runs",
+              stop_when=lambda r: (parse(r.get("run_started_at")) or NOW) < NOW - LOOKBACK,
+          )
+          this = next((r for r in runs if r["id"] == this_run), None)
+
+          print("## Runner-level concurrency and queue depth\n")
+          if probe_windows:
+              win_lo = min(s for s, _ in probe_windows)
+              win_hi = max(e for _, e in probe_windows)
+          elif this:
+              # No probe job in this run ever held a runner (cancelled, or spin
+              # never dispatched). Fall back to this run's own lifetime — never
+              # to NOW, which would stretch the window across unrelated runs and
+              # report their peak as if it were this one's.
+              touched = parse(this.get("updated_at"))
+              win_lo = parse(this["run_started_at"])
+              win_hi = min(touched or NOW, NOW)
+              if win_hi <= win_lo:
+                  win_hi = win_lo + datetime.timedelta(seconds=1)
+              print("No probe job in this run held a runner, so the window below is")
+              print("this run's whole lifetime rather than a measured probe window.\n")
+          else:
+              print("Could not locate this run via the API.")
+              raise SystemExit(0)
+
+          occupied, queued, waits = [], [], []
+          per_run, skipped = {}, []
+          probe_counted = other_counted = never_ran = 0
+
+          for run in runs:
+              started = parse(run.get("run_started_at"))
+              touched = parse(run.get("updated_at"))
+              if started and started > win_hi:
+                  continue  # began after the probe window closed
+              if run.get("status") == "completed" and touched and touched < win_lo:
+                  continue  # finished before it opened
+              try:
+                  jobs = api_pages(
+                      f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs"
+                  )
+              except RuntimeError as exc:
+                  print(f"warning: could not read jobs for run {run['id']}: {exc}", file=sys.stderr)
+                  skipped.append(run["id"])
+                  continue
+              for job in jobs:
+                  created = parse(job.get("created_at"))
+                  window = occupancy(job)
+
+                  if window is None:
+                      # Created but never on a runner: queue depth only. This is
+                      # the signal that separates a ceiling from an under-request.
+                      if created:
+                          done = parse(job.get("completed_at")) if job.get("status") == "completed" else NOW
+                          q = clip(created, min(done or NOW, NOW), win_lo, win_hi)
+                          if q:
+                              queued.append(q)
+                              never_ran += 1
+                      continue
+
+                  start, end = window
+                  if created and start > created:
+                      waits.append((start - created).total_seconds())
+                      q = clip(created, start, win_lo, win_hi)
+                      if q:
+                          queued.append(q)
+
+                  held = clip(start, end, win_lo, win_hi)
+                  if held is None:
+                      continue
+                  occupied.append(held)
+                  per_run.setdefault(run["id"], []).append(held)
+                  if job["name"].startswith("spin"):
+                      probe_counted += 1
+                  else:
+                      other_counted += 1
+
+          if not occupied:
+              print("No job occupied a runner inside this run's probe window.")
+              raise SystemExit(0)
+
+          (peak_occ, peak_at), (peak_q, peak_q_at), (saturated, saturated_at) = paired_sweep(
+              occupied, queued
+          )
+          q_at_peak = count_at(queued, peak_at)
+
+          def hms(t):
+              return t.strftime("%H:%M:%SZ")
+
+          print("Occupied runners counted from the Actions API, first step start to")
+          print("last step end, so runner setup is included — the same thing the")
+          print("concurrency limit governs. Only jobs overlapping this run's probe")
+          print("window are counted, and their windows are clipped to it.\n")
           print("| Metric | Value |")
           print("| --- | --- |")
-          print(f"| Runs considered | {len(per_run)} |")
-          print(f"| Jobs considered | {len(intervals)} |")
-          print(f"| **Peak occupied runners** | **{overall}** |")
-          print(f"| Peak reached at | {at.strftime('%H:%M:%SZ')} |")
-          print(f"| Jobs that never started (excluded) | {never_started} |")
+          print(f"| Probe window | {hms(win_lo)} → {hms(win_hi)} ({int((win_hi - win_lo).total_seconds())}s) |")
+          print(f"| Runs contributing jobs | {len(per_run)} |")
+          print(f"| Jobs that occupied a runner | {len(occupied)} ({probe_counted} probe, {other_counted} other) |")
+          print(f"| **Peak occupied runners** | **{peak_occ}** |")
+          print(f"| Peak reached at | {hms(peak_at)} |")
+          print(f"| Jobs queued at that instant | {q_at_peak} |")
+          print(f"| Peak queue depth | {peak_q}{f' at {hms(peak_q_at)}' if peak_q_at else ''} |")
+          print(f"| **Peak occupancy while jobs were queued** | **{saturated}** |")
+          print(f"| Jobs created that never reached a runner | {never_ran} |")
+          if waits:
+              waits.sort()
+              p = lambda f: waits[min(int(len(waits) * f), len(waits) - 1)]
+              print(f"| Queue wait median / p90 / max | {p(0.5):.0f}s / {p(0.9):.0f}s / {waits[-1]:.0f}s |")
           if skipped:
               print(f"| Runs skipped (unreadable) | {len(skipped)} |")
           print()
+
+          # The whole point of the pairing: decide which of the two situations
+          # produced this peak, rather than leaving it to the reader.
+          if peak_q == 0:
+              print(f"**This run does not bound the limit.** Nothing ever waited for a runner, so")
+              print(f"the fan-out never demanded more than {peak_occ} at once. Raise job_count, raise")
+              print("hold_seconds, or dispatch several runs together, then re-run.\n")
+          elif saturated >= peak_occ:
+              print(f"**{peak_occ} is a ceiling.** Jobs were queued while {peak_occ} runners were busy")
+              print("(peak queue depth {q}), so the account had more work asked of it than it was".format(q=peak_q))
+              print("willing to run. Compare this number against the configured limit.\n")
+          else:
+              print(f"**Ceiling looks like {saturated}, not {peak_occ}.** Occupancy touched {peak_occ}, but only")
+              print(f"while the queue was empty; the most it reached with work waiting was {saturated}")
+              print(f"at {hms(saturated_at)}. Treat {saturated} as the measured limit and re-run with a")
+              print("longer hold_seconds to confirm.\n")
+
+          print("<details><summary>Occupancy and queue depth over time</summary>\n")
+          print("```")
+          print(f"{'t+s':>6}  {'occupied':>8}  {'queued':>7}")
+          span = max((win_hi - win_lo).total_seconds(), 1)
+          samples = 24
+          for i in range(samples + 1):
+              offset = span * i / samples
+              t = win_lo + datetime.timedelta(seconds=offset)
+              print(f"{offset:6.0f}  {count_at(occupied, t):8d}  {count_at(queued, t):7d}")
+          print("```")
+          print("\n</details>\n")
 
           if len(per_run) > 1:
               print("| Run | Jobs | Peak within that run |")
@@ -362,4 +562,11 @@ jobs:
               print()
               print("A peak that matches the sum of the per-run peaks means the runs were not competing;")
               print("a peak well below that sum is the account-wide concurrency limit showing itself.\n")
+
+          print("<details><summary>Caveats on this number</summary>\n")
+          print("- API timestamps are whole seconds, and a runner freed and reused in the same")
+          print("  second counts once, so the peak is a slight lower bound at slot handoff.")
+          print("- `GITHUB_TOKEN` can only read this repository, but concurrency limits apply")
+          print("  per account across all of them. Run this on an otherwise idle org.")
+          print("\n</details>")
           PY
