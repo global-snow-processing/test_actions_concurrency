@@ -119,6 +119,9 @@ before/after for the ticket.
 - Jobs that were created but never reached a runner (queued, or cancelled while
   queued) are counted as queue depth only. They never occupied a runner, and
   counting them as occupancy would inflate the peak by the size of the queue.
+- A wait of 30s or less counts as runner provisioning rather than queueing. A
+  job still booting is not the account holding it back, and counting it as
+  queued made a 4-job smoke run where all four overlapped report a ceiling of 3.
 
 ## Context
 

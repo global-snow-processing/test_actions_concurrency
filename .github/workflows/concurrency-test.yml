@@ -274,6 +274,13 @@ jobs:
           # Only bounds how far back to page the runs list; whether a run counts
           # is decided per job by actual overlap with the probe window.
           LOOKBACK = datetime.timedelta(hours=6)
+          # A job does not appear on its runner the instant it is created, and
+          # that provisioning gap is not the account withholding capacity. Waits
+          # at or below this count as provisioning, not queueing; counting them
+          # made a 4-job smoke run where all four overlapped report a ceiling of
+          # 3, because the last one was still booting through its first second.
+          # Runner startup is documented at ~15-30s.
+          QUEUE_GRACE = datetime.timedelta(seconds=30)
 
           def api_pages(path, key, stop_when=None):
               """Page through a list endpoint by hand.
@@ -440,7 +447,7 @@ jobs:
 
           occupied, queued, waits = [], [], []
           per_run, skipped = {}, []
-          probe_counted = other_counted = never_ran = 0
+          probe_counted = other_counted = never_ran = throttled = 0
 
           for run in runs:
               started = parse(run.get("run_started_at"))
@@ -466,18 +473,22 @@ jobs:
                       # the signal that separates a ceiling from an under-request.
                       if created:
                           done = parse(job.get("completed_at")) if job.get("status") == "completed" else NOW
-                          q = clip(created, min(done or NOW, NOW), win_lo, win_hi)
-                          if q:
-                              queued.append(q)
-                              never_ran += 1
+                          done = min(done or NOW, NOW)
+                          if done - created > QUEUE_GRACE:
+                              q = clip(created, done, win_lo, win_hi)
+                              if q:
+                                  queued.append(q)
+                                  never_ran += 1
                       continue
 
                   start, end = window
                   if created and start > created:
                       waits.append((start - created).total_seconds())
-                      q = clip(created, start, win_lo, win_hi)
-                      if q:
-                          queued.append(q)
+                      if start - created > QUEUE_GRACE:
+                          q = clip(created, start, win_lo, win_hi)
+                          if q:
+                              queued.append(q)
+                              throttled += 1
 
                   held = clip(start, end, win_lo, win_hi)
                   if held is None:
@@ -516,6 +527,7 @@ jobs:
           print(f"| Peak queue depth | {peak_q}{f' at {hms(peak_q_at)}' if peak_q_at else ''} |")
           print(f"| **Peak occupancy while jobs were queued** | **{saturated}** |")
           print(f"| Jobs created that never reached a runner | {never_ran} |")
+          print(f"| Jobs that waited beyond provisioning ({int(QUEUE_GRACE.total_seconds())}s) | {throttled} |")
           if waits:
               waits.sort()
               p = lambda f: waits[min(int(len(waits) * f), len(waits) - 1)]
@@ -566,6 +578,8 @@ jobs:
           print("<details><summary>Caveats on this number</summary>\n")
           print("- API timestamps are whole seconds, and a runner freed and reused in the same")
           print("  second counts once, so the peak is a slight lower bound at slot handoff.")
+          print(f"- A wait of {int(QUEUE_GRACE.total_seconds())}s or less counts as runner provisioning rather than")
+          print("  queueing, so a job still booting is not counted as one being held back.")
           print("- `GITHUB_TOKEN` can only read this repository, but concurrency limits apply")
           print("  per account across all of them. Run this on an otherwise idle org.")
           print("\n</details>")
