@@ -9,12 +9,13 @@ Safe to delete once the limit increase lands.
 
 ## What the workflow does
 
-`.github/workflows/concurrency-test.yml` fans out N identical matrix jobs on
-`ubuntu-latest`. Each job does nothing but sleep for a fixed number of seconds
-and record the wall-clock window during which it held a runner. A final
-`report` job collects those windows and computes, with a sweep over the
-start/end events, both the **peak occupied runners** and the **queue depth at
-the same instants**.
+`.github/workflows/concurrency-test.yml` fans out N matrix jobs on
+`ubuntu-latest`, one per geographic tile. Each job runs the project's snowmelt
+runoff onset detection over its tile (see [What each job
+computes](#what-each-job-computes)) and records the wall-clock window during
+which it held a runner. A final `report` job collects those windows and
+computes, with a sweep over the start/end events, both the **peak occupied
+runners** and the **queue depth at the same instants**.
 
 Both numbers matter, because occupancy on its own does not answer the question.
 Eleven runners busy with nothing waiting means the fan-out never asked for
@@ -24,10 +25,47 @@ than leaving it to the reader.
 
 Nothing is built, nothing is published, and no secrets are used.
 
+## What each job computes
+
+Each matrix job is one 1-degree tile of a 16x16 grid covering 44-60N,
+124-108W — the western North American cordillera, which is seasonal-snow
+country and happens to give exactly 256 tiles, the same as GitHub's per-run
+matrix cap. `scripts/process_tile.py` runs the same detection the wider project
+runs:
+
+> Dry winter snow is nearly transparent at C band, so Sentinel-1 VV backscatter
+> over a snow-covered slope sits close to the bare-ground value. As meltwater
+> appears in the pack, absorption rises and backscatter falls, reaching a
+> minimum around the point the pack saturates and water begins to leave it.
+> Once the pack drains and thins, backscatter climbs back toward bare ground.
+> The date of that seasonal minimum is taken as runoff onset.
+
+Per tile, that runs over 64x64 pixels x 61 acquisitions (one year at the 6-day
+repeat): despeckle each pixel's series with a moving median, take the seasonal
+minimum, reject pixels whose dip is too shallow to be a melt signal, and report
+the median onset day, its spread, and the fraction of pixels resolved.
+
+**The backscatter series is synthetic**, generated deterministically from the
+tile id rather than pulled from an archive. The probe needs hundreds of
+identical, self-contained, network-free jobs, and fetching real granules would
+make every job depend on an external service and its credentials. The detection
+is the real algorithm; only its input is stand-in data. Because the generator
+knows the onset it injected, each tile also reports the RMSE of its own
+estimate — which is what `scripts/test_process_tile.py` asserts against, and
+what the report prints alongside the concurrency numbers.
+
+The work is deliberately light: about 0.4s of CPU for a whole tile. A job lasts
+`hold_seconds` because it processes the tile in twelve blocks on a schedule
+spanning that interval, not because the arithmetic takes that long. What the
+probe needs is a *controlled hold*, not a busy CPU.
+
+`prepare` runs the unit tests before fanning out, so a broken processor fails
+the run in seconds rather than 256 times over.
+
 ## Running it
 
-Automatic: any push (except README-only changes) runs a small 4-job / 30-second
-version, just enough to prove Actions works in the org.
+Automatic: any push (except README-only changes) runs the unit tests plus a
+small 4-job / 30-second version, just enough to prove Actions works in the org.
 
 Manual: **Actions → Concurrency test → Run workflow**, with four inputs:
 
@@ -68,6 +106,10 @@ job, so runner setup is excluded. This is the count of jobs actually executing
 at once, and it runs a little below the runner-level number. It also prints a
 timeline, where queueing shows up as a staircase rather than one solid block.
 
+**Tile results** — how many tiles finished, the median runoff onset across
+them, its range, and the detection RMSE. This is the science output rather than
+a concurrency measurement; it is there so the run says what it actually did.
+
 **Runner-level concurrency and queue depth** — measured from the Actions API
 using each job's step timestamps, across every run overlapping this one. This
 is the number of runners the account had allocated, and it is the number to
@@ -107,8 +149,12 @@ before/after for the ticket.
   workflow running at the same time will lower the peak here. `GITHUB_TOKEN`
   can only read this repository, so the aggregate cannot see the rest of the
   org — run this on an otherwise idle org.
-- `strategy.max-parallel` is deliberately not set, so the only ceiling is the
+- `strategy.max-parallel` is deliberately not set, and there is no
+  `concurrency:` key anywhere in the workflow, so the only ceiling is the
   account limit itself.
+- Each job's runtime is set by its pacing schedule, not by how much work it
+  does, so the measurement is unchanged by making the jobs compute something
+  real. Peak occupancy measured before and after that change was the same.
 - The runner-level windows run from each job's first step start to its last
   step end, so runner provisioning is included — that is what the limit
   governs. A job still running is counted up to the present rather than
@@ -159,6 +205,37 @@ That last step is what the workflow here is for: the "before/after" check
 described above is how the change gets confirmed from the outside, by measuring
 the peak number of runners actually allocated rather than trusting the number in
 the ticket.
+
+### What the measurements actually showed
+
+Measured peak concurrency, recomputed from the Actions API two ways (from step
+timestamps, and from job-level `started_at`/`completed_at`, which is the more
+generous of the two):
+
+| Run | Jobs requested | Jobs that ever ran | Peak concurrent |
+| --- | --- | --- | --- |
+| [32998022145](../../actions/runs/32998022145) | 256 | 256 | 11 |
+| [33007662502](../../actions/runs/33007662502) | 256 | 256 | 15 |
+| [33104888353](../../actions/runs/33104888353) | 256 | 81 | 17 |
+
+Occupancy sat dead flat for the whole 20-minute census window while 241 jobs
+waited, each finishing job replaced within seconds by exactly one queued job.
+That is a hard cap, not a fan-out that failed to ask for more and not an
+autoscaler still ramping — given 241 waiting jobs and 20 minutes, an autoscaler
+would have ramped.
+
+The useful thing for the ticket is that **the org is not reaching the Team
+baseline of 60 either**, and 15 matches no plan tier (Free orgs 20, Pro 40,
+Team 60, Enterprise 180). So the 120 that Support has confirmed as applied is
+probably applied correctly; something else is capping runner allocation before
+that limit is ever reached.
+
+One candidate worth ruling out: a two-day-old organization fanning out hundreds
+of public-repo jobs whose entire body was `sleep 180` is close to the
+fingerprint of hosted-runner abuse, which GitHub throttles independently of the
+plan's concurrency limit. The probe jobs now do real per-tile work instead of
+sleeping, which removes that signature at no cost to the measurement — a job's
+duration is set by its pacing schedule either way.
 
 ### Transcripts
 
