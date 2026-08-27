@@ -1,46 +1,61 @@
 #!/usr/bin/env python3
 """Detect snowmelt runoff onset for one geographic tile.
 
-This is the per-tile unit of work the concurrency probe fans out, and it is the
-same detection the wider project runs: the seasonal minimum of Sentinel-1 C-band
-VV backscatter, evaluated per pixel over one 1-degree cell.
+This is the per-tile unit of work the concurrency probe fans out. The detection
+itself is not reimplemented here: scripts/upstream_processing.py holds the real
+pipeline's functions, copied verbatim from
+egagli/global_snowmelt_runoff_onset at the commit its header names, and this
+module's job is to build a Sentinel-1 RTC-shaped dataset, hand it to
+`calculate_runoff_onset`, and aggregate across water years with
+`median_and_mad_with_min_obs` -- the same two calls the real pipeline makes.
 
-Runoff onset detection
-----------------------
+Runoff onset detection (what the upstream code does)
+----------------------------------------------------
 Dry winter snow is nearly transparent at C band, so sigma0 over a snow-covered
 slope sits close to the bare-ground value. As meltwater appears in the pack,
 absorption rises and sigma0 falls, reaching a minimum around the point the pack
 saturates and water begins to leave it. Once the pack drains and thins, sigma0
-climbs back toward bare ground. The date of that seasonal minimum is taken as
-runoff onset.
+climbs back toward bare ground. Upstream takes the date of that seasonal
+minimum per relative orbit and polarization, then the median across them.
 
 On the input data
 -----------------
-The backscatter series processed here is SYNTHETIC, generated deterministically
-from the tile id rather than pulled from an archive. The probe needs hundreds of
-identical, self-contained, network-free jobs, and fetching real granules would
-make every job depend on an external service and its credentials. The detection
-below is the real algorithm; only its input is stand-in data. Because the
-generator knows the onset it injected, each tile also reports the error of its
-own estimate, which is what the unit tests assert against.
+The backscatter is SYNTHETIC, generated deterministically from the tile id
+rather than pulled from the Planetary Computer. The probe needs hundreds of
+self-contained, network-free, credential-free jobs, and the real STAC search
+plus RTC load would make every job depend on an external service -- which would
+also make it useless as a measurement of runner allocation. What is real here is
+the detection code and the shape of the data it is given: three relative orbits
+interleaved in time at the 12-day repeat, dual polarization, three water years.
+
+Because the generator knows the onset it injected, each tile reports the error
+of upstream's estimate against it. That is what scripts/test_process_tile.py
+asserts on, and it is a live check that the vendored copy still works.
 
 On pacing
 ---------
-The probe measures how many runners the account grants at once, which needs each
-job to hold its runner for a known, controlled interval. The tile is therefore
-processed in blocks on a fixed schedule spanning --hold-seconds rather than as
-fast as the CPU allows. The work is deliberately small; the schedule, not the
-arithmetic, is what sets how long a job lasts.
+The probe measures how many runners the account grants at once, which needs
+each job to hold its runner for a known interval. The tile's twelve
+(water year x latitude band) units are therefore processed on a schedule
+spanning --hold-seconds rather than as fast as the CPU allows. The work is
+small on purpose; the schedule, not the arithmetic, sets how long a job lasts.
 """
 
 import argparse
 import json
 import math
 import os
-import random
 import statistics
 import sys
 import time
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from upstream_processing import calculate_runoff_onset, median_and_mad_with_min_obs
 
 # Tile grid: 16x16 one-degree cells over 44-60N, 124-108W -- the western North
 # American cordillera, which is seasonal-snow country and gives 256 tiles, the
@@ -50,15 +65,19 @@ TILE_DEG = 1.0
 ORIGIN_LAT = 44.0
 ORIGIN_LON = -124.0
 
-PIXELS = 64          # pixels per tile side
-REVISIT_DAYS = 6     # Sentinel-1 repeat interval
-FIRST_DOY = 1
-N_OBS = 61           # ~one year of acquisitions at a 6-day revisit
-BLOCKS = 12          # pacing blocks the tile is processed in
+PIXELS = 32                        # pixels per tile side
+ORBITS = (13, 64, 115)             # sat:relative_orbit values
+ORBIT_REPEAT_DAYS = 12             # Sentinel-1 repeat for a single orbit
+ACQ_PER_ORBIT = 31                 # ~one year per orbit at that repeat
+WATER_YEARS = (2020, 2021, 2022)
+LAT_BANDS = 4                      # spatial chunks per water year
+MIN_YEARS = 2                      # water years required for a median
 
-DRY_SNOW_DB = -9.0   # dry-snow / bare-ground plateau
-SPECKLE_DB = 0.55    # per-observation speckle, 1 sigma
-MIN_DIP_DB = 2.0     # shallowest dip still read as a melt signal
+DRY_SNOW_DB = -9.0                 # dry-snow / bare-ground plateau, VV
+CROSS_POL_OFFSET_DB = -5.0         # VH sits below VV
+SPECKLE_DB = 0.55                  # per-observation speckle, 1 sigma
+MELT_WIDTH_DAYS = 18.0             # width of the wet-snow dip
+TERRAIN_SEED = 1                   # terrain is fixed across water years
 
 
 def tile_bounds(tile_id):
@@ -68,12 +87,8 @@ def tile_bounds(tile_id):
     row, col = divmod(tile_id - 1, GRID)
     lat = ORIGIN_LAT + row * TILE_DEG
     lon = ORIGIN_LON + col * TILE_DEG
-    return {
-        "lat_min": lat,
-        "lat_max": lat + TILE_DEG,
-        "lon_min": lon,
-        "lon_max": lon + TILE_DEG,
-    }
+    return {"lat_min": lat, "lat_max": lat + TILE_DEG,
+            "lon_min": lon, "lon_max": lon + TILE_DEG}
 
 
 def tile_climatology(tile_id):
@@ -81,117 +96,166 @@ def tile_climatology(tile_id):
 
     Runoff onset comes later at higher latitude, so the baseline tracks the
     tile's centre latitude. The spread is set by how much relief the tile
-    contains: a flat tile melts out over a few days, a mountainous one over
-    weeks. Both are drawn once per tile from a tile-seeded generator, so
-    neighbouring tiles differ the way real ones do instead of returning the
-    same answer 256 times.
+    contains: a flat tile melts out over days, a mountainous one over weeks.
+    Both are drawn once per tile, so neighbouring tiles differ the way real ones
+    do instead of returning the same answer 256 times.
     """
     b = tile_bounds(tile_id)
     lat = (b["lat_min"] + b["lat_max"]) / 2
-    rng = random.Random(tile_id)
-    base = 92.0 + 2.2 * (lat - ORIGIN_LAT) + rng.gauss(0.0, 4.0)
-    return base, rng.uniform(15.0, 55.0)
+    rng = np.random.default_rng(tile_id)
+    base = 92.0 + 2.2 * (lat - ORIGIN_LAT) + rng.normal(0.0, 4.0)
+    return float(base), float(rng.uniform(15.0, 55.0))
 
 
-def pixel_profile(rng, row, col, base_onset, relief):
-    """Injected onset day and melt dip depth for one pixel.
-
-    Onset climbs with elevation and the dip deepens with it, since a deeper pack
-    stays wet longer. A smooth ramp across the tile stands in for hypsometry,
-    with local relief on top.
-    """
-    ramp = (row + col) / (2 * (PIXELS - 1))
-    z = min(max(ramp + rng.gauss(0.0, 0.04), 0.0), 1.0)
-    return base_onset + relief * z, 4.0 + 3.0 * z
-
-
-def acquisition_doys():
-    return [FIRST_DOY + i * REVISIT_DAYS for i in range(N_OBS)]
-
-
-def synthesize_series(rng, onset_doy, dip_db):
-    """A year of VV sigma0 (dB) for one pixel, dipping around onset_doy."""
-    width = 18.0
-    series = []
-    for doy in acquisition_doys():
-        d = (doy - onset_doy) / width
-        series.append(DRY_SNOW_DB - dip_db * math.exp(-d * d) + rng.gauss(0.0, SPECKLE_DB))
-    return series
-
-
-def moving_median(values, window=3):
-    """Despeckle the series without shifting the position of its minimum."""
-    half = window // 2
-    out = []
-    for i in range(len(values)):
-        lo = max(0, i - half)
-        hi = min(len(values), i + half + 1)
-        out.append(statistics.median(values[lo:hi]))
-    return out
-
-
-def detect_onset(doys, sigma0):
-    """Runoff onset day of year, or None where no melt signal is present.
-
-    Returns (onset_doy, dip_depth_db). A dip shallower than MIN_DIP_DB is a
-    pixel with no resolvable seasonal snow -- open water, low elevation, or a
-    series that is speckle all the way down -- and is reported as invalid rather
-    than as an onset at whatever day the noise happened to bottom out.
-    """
-    smooth = moving_median(sigma0)
-    floor = min(smooth)
-    depth = statistics.median(smooth) - floor
-    if depth < MIN_DIP_DB:
-        return None, depth
-    return doys[smooth.index(floor)], depth
-
-
-def process_rows(tile_id, row_lo, row_hi):
-    """Detect onset for every pixel in a band of rows."""
-    doys = acquisition_doys()
-    base, relief = tile_climatology(tile_id)
-    found = []
-    for row in range(row_lo, row_hi):
-        for col in range(PIXELS):
-            # Seeded per pixel, so a tile's result does not depend on how its
-            # rows were split into blocks.
-            rng = random.Random(tile_id * 1_000_000 + row * 1_000 + col)
-            truth, dip = pixel_profile(rng, row, col, base, relief)
-            estimate, _ = detect_onset(doys, synthesize_series(rng, truth, dip))
-            if estimate is not None:
-                found.append((estimate, truth))
-    return found
-
-
-def block_bounds():
-    """Row ranges for the pacing blocks, split as evenly as PIXELS allows."""
-    edges = [round(PIXELS * b / BLOCKS) for b in range(BLOCKS + 1)]
+def band_bounds():
+    """Latitude-index ranges for the spatial chunks, split as evenly as possible."""
+    edges = [round(PIXELS * b / LAT_BANDS) for b in range(LAT_BANDS + 1)]
     return list(zip(edges, edges[1:]))
 
 
-def summarize(tile_id, found):
-    onsets = [e for e, _ in found]
+def tile_coords(tile_id):
+    b = tile_bounds(tile_id)
+    lat = np.linspace(b["lat_min"], b["lat_max"], PIXELS, endpoint=False)
+    lon = np.linspace(b["lon_min"], b["lon_max"], PIXELS, endpoint=False)
+    return lat, lon
+
+
+def year_anomaly(tile_id, water_year):
+    """How early or late this water year's spring ran, in days.
+
+    A whole tile shifts together: an early spring is an early spring everywhere
+    in the cell. This is what gives the cross-year median something to average
+    over and the MAD something to measure -- with an identical onset every year
+    the MAD is zero by construction and upstream's aggregation is untested.
+    """
+    return float(np.random.default_rng([tile_id, water_year]).normal(0.0, 9.0))
+
+
+def injected_onset(tile_id, water_year, row_lo=0, row_hi=PIXELS):
+    """Onset day-of-year injected into each pixel, as a (lat, lon) array.
+
+    Onset climbs with elevation, and a smooth ramp across the tile stands in for
+    hypsometry with local relief on top, shifted by that water year's anomaly.
+
+    The whole tile is always generated and then sliced, rather than generating
+    the requested rows directly. Drawing only the slice would seed the terrain
+    off the band boundaries, so the same pixel would get different terrain
+    depending on how the tile happened to be chunked -- and the probe chunks it
+    twelve ways purely to pace itself, which must not change the answer.
+    """
+    base, relief = tile_climatology(tile_id)
+    rows = np.arange(PIXELS)[:, None]
+    cols = np.arange(PIXELS)[None, :]
+    rng = np.random.default_rng([tile_id, TERRAIN_SEED])
+    ramp = (rows + cols) / (2 * (PIXELS - 1))
+    z = np.clip(ramp + rng.normal(0.0, 0.04, size=(PIXELS, PIXELS)), 0.0, 1.0)
+    onset = base + relief * z + year_anomaly(tile_id, water_year)
+    return onset[row_lo:row_hi]
+
+
+def acquisitions(water_year):
+    """Interleaved acquisition times and their relative orbits, sorted in time.
+
+    Each orbit revisits on the 12-day repeat, and the orbits are offset from one
+    another, so the archive for a cell is several sparse series interleaved --
+    which is why upstream reduces per orbit before combining.
+    """
+    times, orbits = [], []
+    start = np.datetime64(f"{water_year - 1}-10-01")
+    for k, orbit in enumerate(ORBITS):
+        first = start + np.timedelta64(4 * k, "D")
+        for i in range(ACQ_PER_ORBIT):
+            times.append(first + np.timedelta64(ORBIT_REPEAT_DAYS * i, "D"))
+            orbits.append(orbit)
+    order = np.argsort(np.array(times))
+    return np.array(times)[order], np.array(orbits)[order]
+
+
+def synthesize_rtc(tile_id, water_year, row_lo, row_hi):
+    """A Sentinel-1 RTC-shaped Dataset for part of a tile, for one water year.
+
+    Matches what upstream's detection expects: data variables per polarization
+    over ('time', 'latitude', 'longitude'), with sat:relative_orbit and
+    water_year as coordinates along time.
+    """
+    onset_doy = injected_onset(tile_id, water_year, row_lo, row_hi)
+    lat, lon = tile_coords(tile_id)
+    lat = lat[row_lo:row_hi]
+    times, orbits = acquisitions(water_year)
+
+    # Depth of the dip grows with the injected onset day: a pack that melts out
+    # later held more water to begin with.
+    base, relief = tile_climatology(tile_id)
+    elevation = (onset_doy - base - year_anomaly(tile_id, water_year)) / max(relief, 1e-6)
+    dip_db = 4.0 + 3.0 * np.clip(elevation, 0.0, 1.0)
+
+    onset_dt = (np.datetime64(f"{water_year}-01-01")
+                + (onset_doy - 1).astype("timedelta64[D]").astype("timedelta64[ns]"))
+    offset_days = ((times[:, None, None].astype("datetime64[ns]") - onset_dt[None, :, :])
+                   / np.timedelta64(1, "D"))
+    wet = dip_db[None, :, :] * np.exp(-((offset_days / MELT_WIDTH_DAYS) ** 2))
+
+    # Speckle is drawn for the whole tile and then sliced, for the same reason
+    # the terrain is: the band split is a pacing detail, not part of the science.
+    rng = np.random.default_rng([tile_id, water_year])
+    full = (len(times), PIXELS, PIXELS)
+    band = slice(row_lo, row_hi)
+    vv = DRY_SNOW_DB - wet + rng.normal(0.0, SPECKLE_DB, size=full)[:, band, :]
+    vh = (DRY_SNOW_DB + CROSS_POL_OFFSET_DB - wet
+          + rng.normal(0.0, SPECKLE_DB, size=full)[:, band, :])
+
+    ds = xr.Dataset(
+        {"vv": (("time", "latitude", "longitude"), vv.astype("float32")),
+         "vh": (("time", "latitude", "longitude"), vh.astype("float32"))},
+        coords={"time": times.astype("datetime64[ns]"), "latitude": lat, "longitude": lon},
+    )
+    ds = ds.assign_coords({
+        "sat:relative_orbit": ("time", orbits),
+        "water_year": ("time", np.full(len(times), water_year)),
+    })
+    return ds, onset_doy
+
+
+def process_unit(tile_id, water_year, row_lo, row_hi):
+    """Run the real detection over one (water year x latitude band) unit."""
+    ds, truth = synthesize_rtc(tile_id, water_year, row_lo, row_hi)
+    estimate = calculate_runoff_onset(ds, returned_dates_format="doy")
+    return estimate, truth
+
+
+def summarize(tile_id, per_year_doy, truth_by_year):
+    """Aggregate across water years with upstream's median/MAD, then report."""
+    stacked = xr.concat(
+        [per_year_doy[y] for y in WATER_YEARS],
+        dim=pd.Index(WATER_YEARS, name="water_year"),
+    )
+    median, mad = median_and_mad_with_min_obs(stacked, dim="water_year", min_count=MIN_YEARS)
+
+    # Upstream's median is across water years, so compare it against the median
+    # of what was injected across those same years, not against any one year.
+    truth = np.median(np.stack([truth_by_year[y] for y in WATER_YEARS]), axis=0)
+    valid = np.isfinite(median.values)
     summary = {
         "tile_id": tile_id,
         "bounds": tile_bounds(tile_id),
         "pixels": PIXELS * PIXELS,
-        "pixels_with_onset": len(found),
-        "acquisitions": N_OBS,
-        "revisit_days": REVISIT_DAYS,
+        "pixels_with_onset": int(valid.sum()),
+        "water_years": list(WATER_YEARS),
+        "relative_orbits": list(ORBITS),
+        "acquisitions_per_water_year": len(ORBITS) * ACQ_PER_ORBIT,
+        "min_water_years_for_median": MIN_YEARS,
     }
-    if onsets:
-        median = statistics.median(onsets)
-        errors = [e - t for e, t in found]
-        summary.update(
-            {
-                "onset_doy_median": round(median, 1),
-                "onset_doy_p10": round(sorted(onsets)[len(onsets) // 10], 1),
-                "onset_doy_p90": round(sorted(onsets)[min(len(onsets) * 9 // 10, len(onsets) - 1)], 1),
-                "onset_doy_mad": round(statistics.median([abs(o - median) for o in onsets]), 1),
-                "rmse_days": round(math.sqrt(sum(e * e for e in errors) / len(errors)), 2),
-                "bias_days": round(sum(errors) / len(errors), 2),
-            }
-        )
+    if valid.any():
+        vals = median.values[valid]
+        errors = vals - truth[valid]
+        summary.update({
+            "onset_doy_median": round(float(np.median(vals)), 1),
+            "onset_doy_p10": round(float(np.percentile(vals, 10)), 1),
+            "onset_doy_p90": round(float(np.percentile(vals, 90)), 1),
+            "onset_doy_mad": round(float(np.nanmedian(mad.values[valid])), 1),
+            "rmse_days": round(float(np.sqrt(np.mean(errors ** 2))), 2),
+            "bias_days": round(float(np.mean(errors)), 2),
+        })
     return summary
 
 
@@ -239,24 +303,34 @@ def main(argv=None):
     if args.deadline:
         hold = min(hold, args.deadline - now)
 
+    units = [(y, lo, hi) for y in WATER_YEARS for lo, hi in band_bounds()]
     print(f"tile {args.tile_id}: {bounds['lat_min']:.0f}-{bounds['lat_max']:.0f}N "
           f"{abs(bounds['lon_max']):.0f}-{abs(bounds['lon_min']):.0f}W, "
-          f"{PIXELS}x{PIXELS} px x {N_OBS} acquisitions")
-    print(f"started {clock(now)}, processing in {BLOCKS} blocks over {hold:.0f}s")
+          f"{PIXELS}x{PIXELS} px, {len(ORBITS)} orbits x {ACQ_PER_ORBIT} acquisitions, "
+          f"water years {WATER_YEARS[0]}-{WATER_YEARS[-1]}")
+    print(f"started {clock(now)}, {len(units)} units over {hold:.0f}s")
 
     start = time.time()
-    found = []
-    for block, (lo, hi) in enumerate(block_bounds(), start=1):
-        found += process_rows(args.tile_id, lo, hi)
-        print(f"  block {block:2d}/{BLOCKS}  rows {lo:2d}-{hi:2d}  "
-              f"{len(found):5d} px with onset  t+{time.time() - start:5.0f}s", flush=True)
-        # Hold the runner to the block's slot in the schedule.
-        remaining = start + hold * block / BLOCKS - time.time()
+    bands = {y: {} for y in WATER_YEARS}
+    truth_bands = {y: {} for y in WATER_YEARS}
+    for n, (year, lo, hi) in enumerate(units, start=1):
+        estimate, truth = process_unit(args.tile_id, year, lo, hi)
+        bands[year][lo] = estimate
+        truth_bands[year][lo] = truth
+        print(f"  unit {n:2d}/{len(units)}  WY{year} rows {lo:2d}-{hi:2d}  "
+              f"t+{time.time() - start:5.0f}s", flush=True)
+        # Hold the runner to this unit's slot in the schedule.
+        remaining = start + hold * n / len(units) - time.time()
         if remaining > 0:
             time.sleep(remaining)
 
+    per_year = {y: xr.concat([bands[y][lo] for lo, _ in band_bounds()], dim="latitude")
+                for y in WATER_YEARS}
+    truth = {y: np.concatenate([truth_bands[y][lo] for lo, _ in band_bounds()], axis=0)
+             for y in WATER_YEARS}
+
     end = time.time()
-    summary = summarize(args.tile_id, found)
+    summary = summarize(args.tile_id, per_year, truth)
     write_window(args.out, args.tile_id, start, end, 1)
     write_tile(args.out, summary)
 
@@ -266,7 +340,8 @@ def main(argv=None):
               f"{summary['onset_doy_p90']}), RMSE {summary['rmse_days']} days over "
               f"{summary['pixels_with_onset']} px")
     else:
-        print(f"tile {args.tile_id} finished {clock(end)}: no pixel showed a melt signal")
+        print(f"tile {args.tile_id} finished {clock(end)}: no pixel met the "
+              f"{MIN_YEARS}-water-year minimum")
     return 0
 
 

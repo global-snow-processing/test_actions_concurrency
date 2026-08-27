@@ -1,0 +1,10 @@
+# What the vendored upstream detection needs, and nothing else. The real
+# pipeline's own environment (icechunk, odc-stac, planetary-computer,
+# geopandas, rasterio, dask, easysnowdata) is solved by pixi and is far too
+# heavy to install in each of 256 concurrent probe jobs.
+#
+# Major versions are capped so a breaking release cannot quietly change what a
+# re-run measures; within that, floating keeps the wheels available.
+numpy>=2.0,<3
+pandas>=2.2,<4
+xarray>=2024.1

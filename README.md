@@ -30,34 +30,56 @@ Nothing is built, nothing is published, and no secrets are used.
 Each matrix job is one 1-degree tile of a 16x16 grid covering 44-60N,
 124-108W — the western North American cordillera, which is seasonal-snow
 country and happens to give exactly 256 tiles, the same as GitHub's per-run
-matrix cap. `scripts/process_tile.py` runs the same detection the wider project
-runs:
+matrix cap.
 
-> Dry winter snow is nearly transparent at C band, so Sentinel-1 VV backscatter
+**The detection is not reimplemented here.** `scripts/upstream_processing.py`
+holds `calculate_runoff_onset` and `median_and_mad_with_min_obs` copied
+verbatim from
+[egagli/global_snowmelt_runoff_onset](https://github.com/egagli/global_snowmelt_runoff_onset)
+(`global_snowmelt_runoff_onset/processing.py`), with the source commit recorded
+in the file header so it can be diffed against upstream. What it does:
+
+> Dry winter snow is nearly transparent at C band, so Sentinel-1 backscatter
 > over a snow-covered slope sits close to the bare-ground value. As meltwater
 > appears in the pack, absorption rises and backscatter falls, reaching a
 > minimum around the point the pack saturates and water begins to leave it.
 > Once the pack drains and thins, backscatter climbs back toward bare ground.
-> The date of that seasonal minimum is taken as runoff onset.
+> Upstream takes the date of that seasonal minimum per relative orbit and
+> polarization, then the median across them; the cross-year median and MAD come
+> from `median_and_mad_with_min_obs`.
 
-Per tile, that runs over 64x64 pixels x 61 acquisitions (one year at the 6-day
-repeat): despeckle each pixel's series with a moving median, take the seasonal
-minimum, reject pixels whose dip is too shallow to be a melt signal, and report
-the median onset day, its spread, and the fraction of pixels resolved.
+`scripts/process_tile.py` is only the harness around those calls. It builds a
+Sentinel-1 RTC-shaped `xarray.Dataset` — 32x32 pixels, three relative orbits
+interleaved in time at the 12-day repeat, dual polarization, three water years,
+93 acquisitions per year — and hands it to upstream, once per
+(water year x latitude band).
 
-**The backscatter series is synthetic**, generated deterministically from the
-tile id rather than pulled from an archive. The probe needs hundreds of
-identical, self-contained, network-free jobs, and fetching real granules would
-make every job depend on an external service and its credentials. The detection
-is the real algorithm; only its input is stand-in data. Because the generator
-knows the onset it injected, each tile also reports the RMSE of its own
-estimate — which is what `scripts/test_process_tile.py` asserts against, and
-what the report prints alongside the concurrency numbers.
+Copied rather than installed because the real package solves its environment
+with pixi (icechunk, odc-stac, planetary-computer, geopandas, rasterio, dask,
+easysnowdata). Standing that up inside each of 256 concurrent jobs would
+dominate the job and add a pile of network failure modes to a measurement that
+is supposed to be about runner allocation. The vendored functions need only
+`numpy`, `pandas` and `xarray` (`scripts/requirements.txt`). Only the
+`returned_dates_format="doy"` path is exercised; the `"dowy"` branch needs
+rioxarray and easysnowdata, which the probe deliberately does not install.
 
-The work is deliberately light: about 0.4s of CPU for a whole tile. A job lasts
-`hold_seconds` because it processes the tile in twelve blocks on a schedule
-spanning that interval, not because the arithmetic takes that long. What the
-probe needs is a *controlled hold*, not a busy CPU.
+**The backscatter is synthetic**, generated deterministically from the tile id
+rather than pulled from the Planetary Computer — hundreds of self-contained,
+credential-free, network-free jobs is the whole point, and a probe whose jobs
+depend on an external archive measures that archive as much as it measures
+GitHub. Onset tracks latitude and per-tile relief, and each water year runs
+early or late as a whole, so the 256 tiles produce 256 different answers and
+the cross-year MAD has something real to measure.
+
+Because the generator knows the onset it injected, each tile reports the error
+of *upstream's* estimate against it — a live check that the vendored copy still
+works. Typical RMSE is ~1.5 days against a 12-day per-orbit repeat, which is
+what the median over three orbits and two polarizations buys.
+
+The work is light: about 0.25s of CPU for a whole tile. A job lasts
+`hold_seconds` because it processes its twelve units on a schedule spanning that
+interval, not because the arithmetic takes that long. What the probe needs is a
+*controlled hold*, not a busy CPU.
 
 `prepare` runs the unit tests before fanning out, so a broken processor fails
 the run in seconds rather than 256 times over.
@@ -66,6 +88,8 @@ the run in seconds rather than 256 times over.
 
 Automatic: any push (except README-only changes) runs the unit tests plus a
 small 4-job / 30-second version, just enough to prove Actions works in the org.
+That smoke run checks correctness, not concurrency — four jobs cannot bound
+anything.
 
 Manual: **Actions → Concurrency test → Run workflow**, with four inputs:
 
@@ -153,8 +177,9 @@ before/after for the ticket.
   `concurrency:` key anywhere in the workflow, so the only ceiling is the
   account limit itself.
 - Each job's runtime is set by its pacing schedule, not by how much work it
-  does, so the measurement is unchanged by making the jobs compute something
-  real. Peak occupancy measured before and after that change was the same.
+  does, so making the jobs compute something real should not move the numbers.
+  That is a reason to expect comparability, not a measurement of it — compare
+  peaks across runs rather than assuming.
 - The runner-level windows run from each job's first step start to its last
   step end, so runner provisioning is included — that is what the limit
   governs. A job still running is counted up to the present rather than
@@ -233,9 +258,13 @@ that limit is ever reached.
 One candidate worth ruling out: a two-day-old organization fanning out hundreds
 of public-repo jobs whose entire body was `sleep 180` is close to the
 fingerprint of hosted-runner abuse, which GitHub throttles independently of the
-plan's concurrency limit. The probe jobs now do real per-tile work instead of
-sleeping, which removes that signature at no cost to the measurement — a job's
-duration is set by its pacing schedule either way.
+plan's concurrency limit. The probe jobs now run the real pipeline's detection
+code on each tile instead of sleeping, which removes that signature at no cost
+to the measurement — a job's duration is set by its pacing schedule either way.
+
+The three peaks above were all measured with the old sleep-based jobs. A
+post-change 256-job run is needed before claiming the change did or did not move
+the ceiling.
 
 ### Transcripts
 
