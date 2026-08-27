@@ -1,7 +1,19 @@
 name: Concurrency test
 
-# Fans out N identical no-op matrix jobs on standard ubuntu-latest runners to
+# Fans out N tile-processing matrix jobs on standard ubuntu-latest runners to
 # measure how many actually execute at the same time.
+#
+# Each job runs scripts/process_tile.py over one 1-degree cell. The detection is
+# not reimplemented: scripts/upstream_processing.py carries the real pipeline's
+# calculate_runoff_onset and median_and_mad_with_min_obs, copied verbatim from
+# egagli/global_snowmelt_runoff_onset, and the job builds a Sentinel-1
+# RTC-shaped dataset (three relative orbits at the 12-day repeat, dual
+# polarisation, three water years) and hands it to them. The backscatter is
+# synthetic and generated locally, so no job depends on the Planetary Computer.
+#
+# The work is small on purpose -- about 0.25s of CPU per tile -- and the job
+# paces its twelve units across hold_seconds so the runner is held for a known
+# interval. What the probe needs is a controlled hold, not a busy CPU.
 #
 # The question is "how many runners does the account hand out at once", and
 # occupancy alone cannot answer it: 11 runners busy with nothing waiting means
@@ -57,6 +69,18 @@ jobs:
       hold_seconds: ${{ steps.gen.outputs.hold_seconds }}
       deadline: ${{ steps.gen.outputs.deadline }}
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --quiet --disable-pip-version-check -r scripts/requirements.txt
+
+      - name: Test the tile processor
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Generate matrix
         id: gen
         env:
@@ -127,39 +151,34 @@ jobs:
       matrix:
         id: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
-      - name: Hold a runner and record the window
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Installed before the hold starts, so setup time is not charged to the
+      # measured window. Occupancy is counted from job start either way.
+      - name: Install dependencies
+        run: python -m pip install --quiet --disable-pip-version-check -r scripts/requirements.txt
+
+      - name: Process tile and record the window
         env:
+          TILE_ID: ${{ matrix.id }}
           HOLD_SECONDS: ${{ needs.prepare.outputs.hold_seconds }}
           DEADLINE: ${{ needs.prepare.outputs.deadline }}
-          JOB_ID: ${{ matrix.id }}
         run: |
-          set -euo pipefail
-          mkdir -p windows
-          now="$(date -u +%s)"
+          python scripts/process_tile.py \
+            --tile-id "$TILE_ID" \
+            --hold-seconds "$HOLD_SECONDS" \
+            --deadline "$DEADLINE" \
+            --out results
 
-          if [ "$now" -ge "$DEADLINE" ]; then
-            echo "job $JOB_ID got a runner at $(date -u -d "@$now" +%H:%M:%SZ), after the census window closed — draining without holding."
-            printf '%s %s %s 0\n' "$JOB_ID" "$now" "$now" > "windows/job-${JOB_ID}.txt"
-            exit 0
-          fi
-
-          hold="$HOLD_SECONDS"
-          remaining=$(( DEADLINE - now ))
-          if [ "$hold" -gt "$remaining" ]; then
-            hold="$remaining"
-          fi
-
-          echo "job $JOB_ID started at $(date -u -d "@$now" +%H:%M:%SZ), holding ${hold}s"
-          sleep "$hold"
-          end="$(date -u +%s)"
-          echo "job $JOB_ID finished at $(date -u -d "@$end" +%H:%M:%SZ)"
-          printf '%s %s %s 1\n' "$JOB_ID" "$now" "$end" > "windows/job-${JOB_ID}.txt"
-
-      - name: Upload window
+      - name: Upload tile result and window
         uses: actions/upload-artifact@v4
         with:
-          name: window-${{ matrix.id }}
-          path: windows/
+          name: tile-${{ matrix.id }}
+          path: results/
           retention-days: 1
 
   report:
@@ -168,11 +187,11 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Download windows
+      - name: Download tile results
         uses: actions/download-artifact@v4
         with:
-          pattern: window-*
-          path: windows
+          pattern: tile-*
+          path: results
           merge-multiple: true
 
       - name: In-job concurrency (this run)
@@ -188,7 +207,7 @@ jobs:
           hold = os.environ.get("HOLD_SECONDS") or "?"
 
           held, drained = [], 0
-          for path in sorted(glob.glob("windows/**/job-*.txt", recursive=True)):
+          for path in sorted(glob.glob("results/**/job-*.txt", recursive=True)):
               with open(path) as fh:
                   for line in fh:
                       parts = line.split()
@@ -256,6 +275,60 @@ jobs:
               print(f"{jid:>4} |{' ' * lo + '#' * (hi - lo):<{width}}| {end - start:>4}s")
           print("```")
           print("\n</details>")
+          PY
+
+      - name: Tile results
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, json, statistics
+
+          tiles = []
+          for path in sorted(glob.glob("results/**/tile-*.json", recursive=True)):
+              with open(path) as fh:
+                  try:
+                      tiles.append(json.load(fh))
+                  except json.JSONDecodeError:
+                      pass
+
+          print("## Tile results\n")
+          if not tiles:
+              print("No tile finished processing inside the census window.\n")
+              raise SystemExit(0)
+
+          onsets = [t["onset_doy_median"] for t in tiles if "onset_doy_median" in t]
+          rmse = [t["rmse_days"] for t in tiles if "rmse_days" in t]
+          px = sum(t["pixels_with_onset"] for t in tiles)
+
+          print("Runoff onset from the pipeline's own calculate_runoff_onset: the seasonal")
+          print("backscatter minimum per relative orbit and polarization, median across them,")
+          print("then median across water years. Each tile also reports the error of that")
+          print("estimate against the onset its synthetic input was built around.\n")
+          print("| Metric | Value |")
+          print("| --- | --- |")
+          print(f"| Tiles processed | {len(tiles)} |")
+          print(f"| Pixels with a detected onset | {px:,} |")
+          if onsets:
+              print(f"| Median onset across tiles | DOY {statistics.median(onsets):.0f} |")
+              print(f"| Onset range across tiles | DOY {min(onsets):.0f} - {max(onsets):.0f} |")
+          if rmse:
+              print(f"| Detection RMSE (median / worst tile) | {statistics.median(rmse):.1f} / {max(rmse):.1f} days |")
+          print()
+
+          if onsets:
+              print("<details><summary>Onset distribution across tiles</summary>\n")
+              print("```")
+              lo, hi = min(onsets), max(onsets)
+              span = max(hi - lo, 1.0)
+              bins = [0] * 12
+              for o in onsets:
+                  bins[min(int((o - lo) / span * 12), 11)] += 1
+              scale = max(max(bins), 1)
+              for i, n in enumerate(bins):
+                  edge = lo + span * i / 12
+                  print(f"DOY {edge:5.0f}  {n:4d}  {'#' * int(n * 40 / scale)}")
+              print("```")
+              print("\n</details>\n")
           PY
 
       - name: Runner-level concurrency and queue depth
